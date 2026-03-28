@@ -3,65 +3,63 @@ import type { OpenClawConfig } from "../config/config.js";
 import { resolveChannelModelOverride } from "./model-overrides.js";
 
 describe("resolveChannelModelOverride", () => {
-  it("matches parent group id when topic suffix is present", () => {
-    const cfg = {
-      channels: {
-        modelByChannel: {
-          telegram: {
-            "-100123": "openai/gpt-4.1",
+  it.each([
+    {
+      name: "matches parent group id when topic suffix is present",
+      input: {
+        cfg: {
+          channels: {
+            modelByChannel: {
+              "demo-group": {
+                "-100123": "demo-provider/demo-parent-model",
+              },
+            },
           },
-        },
+        } as unknown as OpenClawConfig,
+        channel: "demo-group",
+        groupId: "-100123:topic:99",
       },
-    } as unknown as OpenClawConfig;
-    const resolved = resolveChannelModelOverride({
-      cfg,
-      channel: "telegram",
-      groupId: "-100123:topic:99",
-    });
-
-    expect(resolved?.model).toBe("openai/gpt-4.1");
-    expect(resolved?.matchKey).toBe("-100123");
-  });
-
-  it("prefers topic-specific match over parent group id", () => {
-    const cfg = {
-      channels: {
-        modelByChannel: {
-          telegram: {
-            "-100123": "openai/gpt-4.1",
-            "-100123:topic:99": "anthropic/claude-sonnet-4-6",
+      expected: { model: "demo-provider/demo-parent-model", matchKey: "-100123" },
+    },
+    {
+      name: "prefers topic-specific match over parent group id",
+      input: {
+        cfg: {
+          channels: {
+            modelByChannel: {
+              "demo-group": {
+                "-100123": "demo-provider/demo-parent-model",
+                "-100123:topic:99": "demo-provider/demo-topic-model",
+              },
+            },
           },
-        },
+        } as unknown as OpenClawConfig,
+        channel: "demo-group",
+        groupId: "-100123:topic:99",
       },
-    } as unknown as OpenClawConfig;
-    const resolved = resolveChannelModelOverride({
-      cfg,
-      channel: "telegram",
-      groupId: "-100123:topic:99",
-    });
-
-    expect(resolved?.model).toBe("anthropic/claude-sonnet-4-6");
-    expect(resolved?.matchKey).toBe("-100123:topic:99");
-  });
-
-  it("falls back to parent session key when thread id does not match", () => {
-    const cfg = {
-      channels: {
-        modelByChannel: {
-          discord: {
-            "123": "openai/gpt-4.1",
+      expected: { model: "demo-provider/demo-topic-model", matchKey: "-100123:topic:99" },
+    },
+    {
+      name: "falls back to parent session key when thread id does not match",
+      input: {
+        cfg: {
+          channels: {
+            modelByChannel: {
+              "demo-thread": {
+                "123": "demo-provider/demo-parent-model",
+              },
+            },
           },
-        },
+        } as unknown as OpenClawConfig,
+        channel: "demo-thread",
+        groupId: "999",
+        parentSessionKey: "agent:main:demo-thread:channel:123:thread:456",
       },
-    } as unknown as OpenClawConfig;
-    const resolved = resolveChannelModelOverride({
-      cfg,
-      channel: "discord",
-      groupId: "999",
-      parentSessionKey: "agent:main:discord:channel:123:thread:456",
-    });
-
-    expect(resolved?.model).toBe("openai/gpt-4.1");
-    expect(resolved?.matchKey).toBe("123");
+      expected: { model: "demo-provider/demo-parent-model", matchKey: "123" },
+    },
+  ] as const)("$name", ({ input, expected }) => {
+    const resolved = resolveChannelModelOverride(input);
+    expect(resolved?.model).toBe(expected.model);
+    expect(resolved?.matchKey).toBe(expected.matchKey);
   });
 });
