@@ -1,16 +1,13 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+// Msteams tests cover feedback reflection plugin behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  buildFeedbackEvent,
-  buildReflectionPrompt,
-  clearReflectionCooldowns,
-  isReflectionAllowed,
-  loadSessionLearnings,
-  parseReflectionResponse,
-  recordReflectionTime,
-} from "./feedback-reflection.js";
+import { buildReflectionPrompt, parseReflectionResponse } from "./feedback-reflection-prompt.js";
+import { isReflectionAllowed, recordReflectionTime } from "./feedback-reflection-store.js";
+import { buildFeedbackEvent } from "./feedback-reflection.js";
+
+// Matches an unpaired UTF-16 surrogate (lone high or lone low), without relying
+// on the ES2024 String.prototype.isWellFormed() runtime API.
+const UNPAIRED_SURROGATE_RE =
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 describe("buildFeedbackEvent", () => {
   it("builds a well-formed custom event", () => {
@@ -66,6 +63,26 @@ describe("buildReflectionPrompt", () => {
     expect(prompt.length).toBeLessThan(longResponse.length + 500);
   });
 
+  it("does not split UTF-16 surrogate pairs when truncating a thumbed-down response", () => {
+    const thumbedDownResponse = `${"a".repeat(499)}🦞${"b".repeat(20)}`;
+
+    const prompt = buildReflectionPrompt({ thumbedDownResponse });
+
+    expect(prompt).not.toMatch(UNPAIRED_SURROGATE_RE);
+    expect(prompt).toContain(`${"a".repeat(499)}...`);
+    expect(prompt).not.toContain("\ud83e");
+    expect(prompt).not.toContain("\udd9e");
+  });
+
+  it("keeps a boundary emoji when it fully fits before the truncation cap", () => {
+    const thumbedDownResponse = `${"a".repeat(498)}🦞${"b".repeat(20)}`;
+
+    const prompt = buildReflectionPrompt({ thumbedDownResponse });
+
+    expect(prompt).not.toMatch(UNPAIRED_SURROGATE_RE);
+    expect(prompt).toContain(`${"a".repeat(498)}🦞...`);
+  });
+
   it("includes user comment when provided", () => {
     const prompt = buildReflectionPrompt({
       thumbedDownResponse: "Some response",
@@ -117,69 +134,40 @@ describe("parseReflectionResponse", () => {
 
 describe("reflection cooldown", () => {
   afterEach(() => {
-    clearReflectionCooldowns();
     vi.restoreAllMocks();
   });
 
   it("allows first reflection", () => {
-    expect(isReflectionAllowed("session-1")).toBe(true);
+    expect(isReflectionAllowed("session-first")).toBe(true);
   });
 
   it("blocks reflection within cooldown", () => {
-    recordReflectionTime("session-1");
-    expect(isReflectionAllowed("session-1", 60_000)).toBe(false);
+    recordReflectionTime("session-blocked");
+    expect(isReflectionAllowed("session-blocked", 60_000)).toBe(false);
   });
 
   it("allows reflection after cooldown expires", () => {
-    // Manually set a past timestamp
-    recordReflectionTime("session-1");
-    // Override the map entry to simulate time passing
-    clearReflectionCooldowns();
-    expect(isReflectionAllowed("session-1", 1)).toBe(true);
+    vi.spyOn(Date, "now").mockReturnValue(0);
+    recordReflectionTime("session-expired");
+    vi.spyOn(Date, "now").mockReturnValue(2);
+    expect(isReflectionAllowed("session-expired", 1)).toBe(true);
   });
 
   it("tracks sessions independently", () => {
-    recordReflectionTime("session-1");
-    expect(isReflectionAllowed("session-1", 60_000)).toBe(false);
-    expect(isReflectionAllowed("session-2", 60_000)).toBe(true);
+    recordReflectionTime("session-tracked-1");
+    expect(isReflectionAllowed("session-tracked-1", 60_000)).toBe(false);
+    expect(isReflectionAllowed("session-tracked-2", 60_000)).toBe(true);
   });
 
   it("keeps longer custom cooldown entries during pruning", () => {
     vi.spyOn(Date, "now").mockReturnValue(0);
-    recordReflectionTime("target", 600_000);
+    recordReflectionTime("prune-target", 600_000);
 
     vi.spyOn(Date, "now").mockReturnValue(301_000);
     for (let index = 0; index <= 500; index += 1) {
-      recordReflectionTime(`session-${index}`, 600_000);
+      recordReflectionTime(`prune-session-${index}`, 600_000);
     }
 
-    expect(isReflectionAllowed("target", 600_000)).toBe(false);
-  });
-});
-
-describe("loadSessionLearnings", () => {
-  let tmpDir: string;
-
-  afterEach(async () => {
-    if (tmpDir) {
-      await rm(tmpDir, { recursive: true, force: true });
-    }
-  });
-
-  it("returns empty array when file doesn't exist", async () => {
-    tmpDir = await mkdtemp(path.join(os.tmpdir(), "learnings-test-"));
-    const learnings = await loadSessionLearnings(tmpDir, "nonexistent");
-    expect(learnings).toEqual([]);
-  });
-
-  it("reads existing learnings", async () => {
-    tmpDir = await mkdtemp(path.join(os.tmpdir(), "learnings-test-"));
-    // Colons are sanitized to underscores in filenames (Windows compat)
-    const safeKey = "msteams_user1";
-    const filePath = path.join(tmpDir, `${safeKey}.learnings.json`);
-    await writeFile(filePath, JSON.stringify(["Be concise", "Use examples"]), "utf-8");
-
-    const learnings = await loadSessionLearnings(tmpDir, "msteams:user1");
-    expect(learnings).toEqual(["Be concise", "Use examples"]);
+    expect(isReflectionAllowed("prune-target", 600_000)).toBe(false);
   });
 });

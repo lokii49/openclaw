@@ -1,4 +1,2 @@
-// Deprecated compatibility alias.
-// Prefer openclaw/plugin-sdk/testing for public test helpers.
-
-export * from "./testing.js";
+/** @deprecated Prefer the focused `plugin-test-runtime` subpath. */
+export * from "./plugin-test-runtime.js";

@@ -1,10 +1,12 @@
+// Defines Google Chat channel configuration types.
 import type {
-  BlockStreamingCoalesceConfig,
+  ChannelDeliveryStreamingConfig,
   DmPolicy,
   GroupPolicy,
   ReplyToMode,
 } from "./types.base.js";
-import type { ChannelHealthMonitorConfig } from "./types.channels.js";
+import type { ChannelBotLoopProtectionConfig } from "./types.bot-loop-protection.js";
+import type { ChannelHealthMonitorConfig } from "./types.channel-health.js";
 import type { DmConfig } from "./types.messages.js";
 import type { SecretRef } from "./types.secrets.js";
 
@@ -18,12 +20,12 @@ export type GoogleChatDmConfig = {
 };
 
 export type GoogleChatGroupConfig = {
-  /** If false, disable the bot in this space. (Alias for allow: false.) */
+  /** If false, disable the bot in this space. */
   enabled?: boolean;
-  /** Legacy allow toggle; prefer enabled. */
-  allow?: boolean;
   /** Require mentioning the bot to trigger replies. */
   requireMention?: boolean;
+  /** Sliding-window bot-pair loop guard for accepted bot-authored Google Chat messages. */
+  botLoopProtection?: ChannelBotLoopProtectionConfig;
   /** Allowlist of users that can invoke the bot in this space. */
   users?: Array<string | number>;
   /** Optional system prompt for this space. */
@@ -31,6 +33,7 @@ export type GoogleChatGroupConfig = {
 };
 
 export type GoogleChatActionConfig = {
+  /** @deprecated Accepted for config compatibility; service-account auth cannot use reaction APIs. */
   reactions?: boolean;
 };
 
@@ -45,6 +48,8 @@ export type GoogleChatAccountConfig = {
   enabled?: boolean;
   /** Allow bot-authored messages to trigger replies (default: false). */
   allowBots?: boolean;
+  /** Sliding-window bot-pair loop guard for accepted bot-authored Google Chat messages. */
+  botLoopProtection?: ChannelBotLoopProtectionConfig;
   /**
    * Break-glass override: allow mutable principal matching (raw email entries) in allowlists.
    * Default behavior is ID-only matching.
@@ -91,13 +96,10 @@ export type GoogleChatAccountConfig = {
   dms?: Record<string, DmConfig>;
   /** Outbound text chunk size (chars). Default: 4000. */
   textChunkLimit?: number;
-  /** Chunking mode: "length" (default) splits by size; "newline" splits on every newline. */
-  chunkMode?: "length" | "newline";
-  blockStreaming?: boolean;
-  /** Merge streamed block replies before sending. */
-  blockStreamingCoalesce?: BlockStreamingCoalesceConfig;
+  /** Delivery streaming config: chunk mode plus block streaming controls. */
+  streaming?: ChannelDeliveryStreamingConfig;
   mediaMaxMb?: number;
-  /** Control reply threading when reply tags are present (off|first|all). */
+  /** Control reply threading when reply tags are present (off|first|all|batched). */
   replyToMode?: ReplyToMode;
   /** Per-action tool gating (default: true for all). */
   actions?: GoogleChatActionConfig;
@@ -123,9 +125,3 @@ export type GoogleChatConfig = {
   /** Optional default account id when multiple accounts are configured. */
   defaultAccount?: string;
 } & GoogleChatAccountConfig;
-
-declare module "./types.channels.js" {
-  interface ChannelsConfig {
-    googlechat?: GoogleChatConfig;
-  }
-}

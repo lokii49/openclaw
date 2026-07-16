@@ -16,6 +16,8 @@ export {
   success,
   warn,
 } from "../globals.js";
+export { sleep } from "../utils/sleep.js";
+export { withTimeout } from "../utils/with-timeout.js";
 export { isTruthyEnvValue } from "../infra/env.js";
 export * from "../logging.js";
 export { waitForAbortSignal } from "../infra/abort-signal.js";
@@ -26,5 +28,8 @@ export {
 } from "../infra/format-time/format-duration.ts";
 export { retryAsync } from "../infra/retry.js";
 export { ensureGlobalUndiciEnvProxyDispatcher } from "../infra/net/undici-global-dispatcher.js";
-export { registerUnhandledRejectionHandler } from "../infra/unhandled-rejections.js";
+export {
+  registerUncaughtExceptionHandler,
+  registerUnhandledRejectionHandler,
+} from "../infra/unhandled-rejections.js";
 export { isWSL2Sync } from "../infra/wsl.js";

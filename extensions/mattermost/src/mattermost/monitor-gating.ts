@@ -1,10 +1,11 @@
-import type { ChatType, OpenClawConfig } from "../runtime-api.js";
+// Mattermost plugin module implements monitor gating behavior.
+import type { ChatType, OpenClawConfig } from "./runtime-api.js";
 
 export function mapMattermostChannelTypeToChatType(channelType?: string | null): ChatType {
-  if (!channelType) {
-    return "channel";
+  const normalized = channelType?.trim().toUpperCase();
+  if (!normalized) {
+    return "direct";
   }
-  const normalized = channelType.trim().toUpperCase();
   if (normalized === "D") {
     return "direct";
   }
@@ -14,7 +15,18 @@ export function mapMattermostChannelTypeToChatType(channelType?: string | null):
   return "channel";
 }
 
-export type MattermostRequireMentionResolverInput = {
+export function resolveMattermostTrustedChatKind(params: {
+  channelType?: string | null;
+  fallback?: ChatType;
+}): ChatType {
+  const channelType = params.channelType?.trim();
+  if (channelType) {
+    return mapMattermostChannelTypeToChatType(channelType);
+  }
+  return params.fallback ?? "direct";
+}
+
+type MattermostRequireMentionResolverInput = {
   cfg: OpenClawConfig;
   channel: "mattermost";
   accountId: string;
@@ -22,7 +34,7 @@ export type MattermostRequireMentionResolverInput = {
   requireMentionOverride?: boolean;
 };
 
-export type MattermostMentionGateInput = {
+type MattermostMentionGateInput = {
   kind: ChatType;
   cfg: OpenClawConfig;
   accountId: string;
@@ -31,6 +43,9 @@ export type MattermostMentionGateInput = {
   requireMentionOverride?: boolean;
   resolveRequireMention: (params: MattermostRequireMentionResolverInput) => boolean;
   wasMentioned: boolean;
+  // Bot has already replied in this thread; treat follow-ups as addressed so the
+  // user need not re-mention on every turn (parity with Slack thread participation).
+  threadAlreadyEngaged?: boolean;
   isControlCommand: boolean;
   commandAuthorized: boolean;
   oncharEnabled: boolean;
@@ -63,12 +78,16 @@ export function evaluateMattermostMentionGate(
     !params.wasMentioned &&
     params.commandAuthorized;
   const effectiveWasMentioned =
-    params.wasMentioned || shouldBypassMention || params.oncharTriggered;
+    params.wasMentioned ||
+    shouldBypassMention ||
+    params.oncharTriggered ||
+    params.threadAlreadyEngaged === true;
   if (
     params.oncharEnabled &&
     !params.oncharTriggered &&
     !params.wasMentioned &&
-    !params.isControlCommand
+    !params.isControlCommand &&
+    params.threadAlreadyEngaged !== true
   ) {
     return {
       shouldRequireMention,

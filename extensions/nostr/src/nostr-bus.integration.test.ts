@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+// Nostr tests cover nostr bus.integration plugin behavior.
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMetrics, createNoopMetrics, type MetricEvent } from "./metrics.js";
 import { createSeenTracker } from "./seen-tracker.js";
 import { TEST_RELAY_URL } from "./test-fixtures.js";
@@ -8,6 +10,10 @@ const TEST_RELAY_URL_2 = "wss://relay2.com";
 const TEST_RELAY_URL_PRIMARY = "wss://relay.com";
 const TEST_RELAY_URL_GOOD = "wss://good-relay.com";
 const TEST_RELAY_URL_BAD = "wss://bad-relay.com";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function createTracker(overrides?: Partial<Parameters<typeof createSeenTracker>[0]>) {
   return createSeenTracker({
@@ -27,6 +33,10 @@ function createCollectingMetrics() {
 
 function createPlainMetrics() {
   return createMetrics();
+}
+
+function requireRecordEntry<T>(entries: Record<string, T>, key: string, context: string): T {
+  return expectDefined(entries[key], context);
 }
 
 // ============================================================================
@@ -163,10 +173,23 @@ describe("SeenTracker", () => {
 
       tracker.stop();
     });
+
+    it("keeps non-positive capacities usable", () => {
+      const tracker = createTracker({ maxEntries: 0 });
+
+      tracker.add("id1");
+      tracker.add("id2");
+
+      expect(tracker.size()).toBe(1);
+      expect(tracker.peek("id1")).toBe(false);
+      expect(tracker.peek("id2")).toBe(true);
+
+      tracker.stop();
+    });
   });
 
   describe("TTL expiration", () => {
-    it("expires entries after TTL", async () => {
+    it("expires entries after TTL", () => {
       vi.useFakeTimers();
 
       const tracker = createTracker({
@@ -188,7 +211,7 @@ describe("SeenTracker", () => {
       vi.useRealTimers();
     });
 
-    it("has() refreshes TTL", async () => {
+    it("has() refreshes TTL", () => {
       vi.useFakeTimers();
 
       const tracker = createTracker({
@@ -214,6 +237,55 @@ describe("SeenTracker", () => {
       tracker.stop();
       vi.useRealTimers();
     });
+
+    it.each([-1, 0])("falls back to default TTL for non-positive ttlMs %s", (ttlMs) => {
+      vi.useFakeTimers();
+      const tracker = createTracker({ ttlMs, pruneIntervalMs: 10 * 60 * 1000 });
+
+      try {
+        tracker.add("id1");
+        vi.advanceTimersByTime(1);
+        expect(tracker.peek("id1")).toBe(true);
+      } finally {
+        tracker.stop();
+        vi.useRealTimers();
+      }
+    });
+
+    it("falls back to default TTL for infinite ttlMs", () => {
+      vi.useFakeTimers();
+      const tracker = createTracker({
+        ttlMs: Number.POSITIVE_INFINITY,
+        pruneIntervalMs: 10 * 60 * 1000,
+      });
+
+      try {
+        tracker.add("id1");
+        vi.advanceTimersByTime(60 * 60 * 1000 + 1);
+        expect(tracker.peek("id1")).toBe(false);
+      } finally {
+        tracker.stop();
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([-1, 0, Number.POSITIVE_INFINITY])(
+      "uses the default prune interval for unsafe pruneIntervalMs %s",
+      (pruneIntervalMs) => {
+        vi.useFakeTimers();
+        const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+        const tracker = createTracker({ pruneIntervalMs });
+
+        try {
+          expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+          expect(setIntervalSpy.mock.calls[0]?.[1]).toBe(10 * 60 * 1000);
+        } finally {
+          tracker.stop();
+          setIntervalSpy.mockRestore();
+          vi.useRealTimers();
+        }
+      },
+    );
   });
 });
 
@@ -231,9 +303,9 @@ describe("Metrics", () => {
       metrics.emit("event.duplicate");
 
       expect(events).toHaveLength(3);
-      expect(events[0].name).toBe("event.received");
-      expect(events[1].name).toBe("event.processed");
-      expect(events[2].name).toBe("event.duplicate");
+      expect(expectDefined(events[0], "first Nostr metric event").name).toBe("event.received");
+      expect(expectDefined(events[1], "second Nostr metric event").name).toBe("event.processed");
+      expect(expectDefined(events[2], "third Nostr metric event").name).toBe("event.duplicate");
     });
 
     it("includes labels in metric events", () => {
@@ -241,7 +313,9 @@ describe("Metrics", () => {
 
       metrics.emit("relay.connect", 1, { relay: TEST_RELAY_URL });
 
-      expect(events[0].labels).toEqual({ relay: TEST_RELAY_URL });
+      expect(expectDefined(events[0], "first Nostr metric event").labels).toEqual({
+        relay: TEST_RELAY_URL,
+      });
     });
 
     it("accumulates counters in snapshot", () => {
@@ -269,11 +343,18 @@ describe("Metrics", () => {
       metrics.emit("relay.error", 1, { relay: TEST_RELAY_URL_1 });
 
       const snapshot = metrics.getSnapshot();
-      expect(snapshot.relays[TEST_RELAY_URL_1]).toBeDefined();
-      expect(snapshot.relays[TEST_RELAY_URL_1].connects).toBe(1);
-      expect(snapshot.relays[TEST_RELAY_URL_1].errors).toBe(2);
-      expect(snapshot.relays[TEST_RELAY_URL_2].connects).toBe(1);
-      expect(snapshot.relays[TEST_RELAY_URL_2].errors).toBe(0);
+      const relayOne = requireRecordEntry(snapshot.relays, TEST_RELAY_URL_1, "Nostr relay metrics");
+      if (!relayOne) {
+        throw new Error("expected first relay metrics");
+      }
+      expect(relayOne.connects).toBe(1);
+      expect(relayOne.errors).toBe(2);
+      expect(
+        requireRecordEntry(snapshot.relays, TEST_RELAY_URL_2, "Nostr relay metrics").connects,
+      ).toBe(1);
+      expect(
+        requireRecordEntry(snapshot.relays, TEST_RELAY_URL_2, "Nostr relay metrics").errors,
+      ).toBe(0);
     });
 
     it("tracks circuit breaker state changes", () => {
@@ -282,14 +363,26 @@ describe("Metrics", () => {
       metrics.emit("relay.circuit_breaker.open", 1, { relay: TEST_RELAY_URL_PRIMARY });
 
       let snapshot = metrics.getSnapshot();
-      expect(snapshot.relays[TEST_RELAY_URL_PRIMARY].circuitBreakerState).toBe("open");
-      expect(snapshot.relays[TEST_RELAY_URL_PRIMARY].circuitBreakerOpens).toBe(1);
+      expect(
+        requireRecordEntry(snapshot.relays, TEST_RELAY_URL_PRIMARY, "Nostr relay metrics")
+          .circuitBreakerState,
+      ).toBe("open");
+      expect(
+        requireRecordEntry(snapshot.relays, TEST_RELAY_URL_PRIMARY, "Nostr relay metrics")
+          .circuitBreakerOpens,
+      ).toBe(1);
 
       metrics.emit("relay.circuit_breaker.close", 1, { relay: TEST_RELAY_URL_PRIMARY });
 
       snapshot = metrics.getSnapshot();
-      expect(snapshot.relays[TEST_RELAY_URL_PRIMARY].circuitBreakerState).toBe("closed");
-      expect(snapshot.relays[TEST_RELAY_URL_PRIMARY].circuitBreakerCloses).toBe(1);
+      expect(
+        requireRecordEntry(snapshot.relays, TEST_RELAY_URL_PRIMARY, "Nostr relay metrics")
+          .circuitBreakerState,
+      ).toBe("closed");
+      expect(
+        requireRecordEntry(snapshot.relays, TEST_RELAY_URL_PRIMARY, "Nostr relay metrics")
+          .circuitBreakerCloses,
+      ).toBe(1);
     });
 
     it("tracks all rejection reasons", () => {
@@ -330,7 +423,11 @@ describe("Metrics", () => {
       metrics.emit("relay.message.auth", 1, { relay: TEST_RELAY_URL_PRIMARY });
 
       const snapshot = metrics.getSnapshot();
-      const relay = snapshot.relays[TEST_RELAY_URL_PRIMARY];
+      const relay = requireRecordEntry(
+        snapshot.relays,
+        TEST_RELAY_URL_PRIMARY,
+        "Nostr relay metrics",
+      );
       expect(relay.messagesReceived.event).toBe(1);
       expect(relay.messagesReceived.eose).toBe(1);
       expect(relay.messagesReceived.closed).toBe(1);
@@ -379,13 +476,11 @@ describe("Metrics", () => {
   });
 
   describe("createNoopMetrics", () => {
-    it("does not throw on emit", () => {
+    it("ignores emitted metrics", () => {
       const metrics = createNoopMetrics();
 
-      expect(() => {
-        metrics.emit("event.received");
-        metrics.emit("relay.connect", 1, { relay: TEST_RELAY_URL_PRIMARY });
-      }).not.toThrow();
+      expect(metrics.emit("event.received")).toBeUndefined();
+      expect(metrics.emit("relay.connect", 1, { relay: TEST_RELAY_URL_PRIMARY })).toBeUndefined();
     });
 
     it("returns empty snapshot", () => {
@@ -419,9 +514,15 @@ describe("Circuit Breaker Behavior", () => {
 
     const cbEvents = events.filter((e) => e.name.startsWith("relay.circuit_breaker"));
     expect(cbEvents).toHaveLength(3);
-    expect(cbEvents[0].name).toBe("relay.circuit_breaker.open");
-    expect(cbEvents[1].name).toBe("relay.circuit_breaker.half_open");
-    expect(cbEvents[2].name).toBe("relay.circuit_breaker.close");
+    expect(expectDefined(cbEvents[0], "circuit breaker open event").name).toBe(
+      "relay.circuit_breaker.open",
+    );
+    expect(expectDefined(cbEvents[1], "circuit breaker half-open event").name).toBe(
+      "relay.circuit_breaker.half_open",
+    );
+    expect(expectDefined(cbEvents[2], "circuit breaker close event").name).toBe(
+      "relay.circuit_breaker.close",
+    );
   });
 });
 
@@ -442,8 +543,12 @@ describe("Health Scoring", () => {
     metrics.emit("relay.error", 1, { relay: TEST_RELAY_URL_BAD });
 
     const snapshot = metrics.getSnapshot();
-    expect(snapshot.relays[TEST_RELAY_URL_GOOD].errors).toBe(0);
-    expect(snapshot.relays[TEST_RELAY_URL_BAD].errors).toBe(3);
+    expect(
+      requireRecordEntry(snapshot.relays, TEST_RELAY_URL_GOOD, "Nostr relay metrics").errors,
+    ).toBe(0);
+    expect(
+      requireRecordEntry(snapshot.relays, TEST_RELAY_URL_BAD, "Nostr relay metrics").errors,
+    ).toBe(3);
   });
 });
 
@@ -459,7 +564,7 @@ describe("Reconnect Backoff", () => {
     const JITTER = 0.3;
 
     for (let attempt = 0; attempt < 10; attempt++) {
-      const exponential = BASE * Math.pow(2, attempt);
+      const exponential = BASE * 2 ** attempt;
       const capped = Math.min(exponential, MAX);
       const minDelay = capped * (1 - JITTER);
       const maxDelay = capped * (1 + JITTER);

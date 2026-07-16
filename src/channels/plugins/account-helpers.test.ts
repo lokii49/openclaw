@@ -1,9 +1,11 @@
+// Account helper tests cover channel account normalization and lookup helpers.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { normalizeAccountId } from "../../routing/session-key.js";
 import {
   createAccountListHelpers,
   describeAccountSnapshot,
+  describeWebhookAccountSnapshot,
   listCombinedAccountIds,
   mergeAccountConfig,
   resolveListedDefaultAccountId,
@@ -120,6 +122,41 @@ describe("createAccountListHelpers", () => {
         input,
         expected,
       });
+    });
+
+    it("keeps an implicit default account when root credential keys coexist with named accounts", () => {
+      const helpers = createAccountListHelpers("testchannel", {
+        implicitDefaultAccount: { channelKeys: ["token"] },
+      });
+
+      expect(
+        helpers.listAccountIds({
+          channels: {
+            testchannel: {
+              token: "root-token",
+              accounts: { work: {} },
+            },
+          },
+        } as unknown as OpenClawConfig),
+      ).toEqual(["default", "work"]);
+    });
+
+    it("keeps an implicit default account when root env credentials coexist with named accounts", () => {
+      const previous = process.env.TESTCHANNEL_TOKEN;
+      process.env.TESTCHANNEL_TOKEN = "env-token";
+      try {
+        const helpers = createAccountListHelpers("testchannel", {
+          implicitDefaultAccount: { envVars: ["TESTCHANNEL_TOKEN"] },
+        });
+
+        expect(helpers.listAccountIds(cfg({ work: {} }))).toEqual(["default", "work"]);
+      } finally {
+        if (previous === undefined) {
+          delete process.env.TESTCHANNEL_TOKEN;
+        } else {
+          process.env.TESTCHANNEL_TOKEN = previous;
+        }
+      }
     });
   });
 
@@ -272,6 +309,47 @@ describe("describeAccountSnapshot", () => {
       name: undefined,
       enabled: true,
       configured: undefined,
+    });
+  });
+});
+
+describe("describeWebhookAccountSnapshot", () => {
+  it("defaults mode to webhook while preserving caller extras", () => {
+    expect(
+      describeWebhookAccountSnapshot({
+        account: {
+          accountId: "work",
+          name: "Work",
+        },
+        configured: true,
+        extra: {
+          tokenSource: "config",
+        },
+      }),
+    ).toEqual({
+      accountId: "work",
+      name: "Work",
+      enabled: true,
+      configured: true,
+      tokenSource: "config",
+      mode: "webhook",
+    });
+  });
+
+  it("allows callers to override the mode when the transport is not always webhook", () => {
+    expect(
+      describeWebhookAccountSnapshot({
+        account: {
+          accountId: "work",
+        },
+        mode: "polling",
+      }),
+    ).toEqual({
+      accountId: "work",
+      name: undefined,
+      enabled: true,
+      configured: undefined,
+      mode: "polling",
     });
   });
 });

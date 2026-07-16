@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+// Ensures UI code opens external URLs through the safe helper.
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
@@ -15,19 +16,9 @@ const repoRoot = resolveRepoRoot(import.meta.url);
 const uiSourceDir = path.join(repoRoot, "ui", "src", "ui");
 const allowedCallsites = new Set([path.join(uiSourceDir, "open-external-url.ts")]);
 
-function asPropertyAccess(expression) {
-  if (ts.isPropertyAccessExpression(expression)) {
-    return expression;
-  }
-  if (typeof ts.isPropertyAccessChain === "function" && ts.isPropertyAccessChain(expression)) {
-    return expression;
-  }
-  return null;
-}
-
 function isRawWindowOpenCall(expression) {
-  const propertyAccess = asPropertyAccess(unwrapExpression(expression));
-  if (!propertyAccess || propertyAccess.name.text !== "open") {
+  const propertyAccess = unwrapExpression(expression);
+  if (!ts.isPropertyAccessExpression(propertyAccess) || propertyAccess.name.text !== "open") {
     return false;
   }
 
@@ -37,6 +28,9 @@ function isRawWindowOpenCall(expression) {
   );
 }
 
+/**
+ * Finds raw `window.open(...)` or `globalThis.open(...)` call lines.
+ */
 export function findRawWindowOpenLines(content, fileName = "source.ts") {
   const sourceFile = ts.createSourceFile(fileName, content, ts.ScriptTarget.Latest, true);
   const lines = [];
@@ -52,6 +46,9 @@ export function findRawWindowOpenLines(content, fileName = "source.ts") {
   return lines;
 }
 
+/**
+ * Runs the raw window.open guard.
+ */
 export async function main() {
   const files = await collectTypeScriptFiles(uiSourceDir, {
     extraTestSuffixes: [".browser.test.ts", ".node.test.ts"],
@@ -79,7 +76,7 @@ export async function main() {
   for (const violation of violations) {
     console.error(`- ${violation}`);
   }
-  console.error("Use openExternalUrlSafe(...) from ui/src/ui/open-external-url.ts instead.");
+  console.error("Use openExternalUrlSafe(...) from ui/src/lib/open-external-url.ts instead.");
   process.exit(1);
 }
 

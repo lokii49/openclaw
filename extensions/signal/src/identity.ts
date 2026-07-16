@@ -1,28 +1,23 @@
-import { evaluateSenderGroupAccessForPolicy } from "openclaw/plugin-sdk/group-access";
-import { normalizeE164 } from "openclaw/plugin-sdk/text-runtime";
+// Signal plugin module implements identity behavior.
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeE164 } from "openclaw/plugin-sdk/text-utility-runtime";
+import { looksLikeUuid } from "./uuid.js";
+
+type SignalSenderAliases = {
+  e164?: string;
+  uuid?: string;
+};
 
 export type SignalSender =
-  | { kind: "phone"; raw: string; e164: string }
-  | { kind: "uuid"; raw: string };
+  | { kind: "phone"; raw: string; e164: string; aliases?: SignalSenderAliases }
+  | { kind: "uuid"; raw: string; aliases?: SignalSenderAliases };
 
 type SignalAllowEntry =
   | { kind: "any" }
   | { kind: "phone"; e164: string }
   | { kind: "uuid"; raw: string };
 
-const UUID_HYPHENATED_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const UUID_COMPACT_RE = /^[0-9a-f]{32}$/i;
-
-export function looksLikeUuid(value: string): boolean {
-  if (UUID_HYPHENATED_RE.test(value) || UUID_COMPACT_RE.test(value)) {
-    return true;
-  }
-  const compact = value.replace(/-/g, "");
-  if (!/^[0-9a-f]+$/i.test(compact)) {
-    return false;
-  }
-  return /[a-f]/i.test(compact);
-}
+export { looksLikeUuid } from "./uuid.js";
 
 function stripSignalPrefix(value: string): string {
   return value.replace(/^signal:/i, "").trim();
@@ -33,14 +28,18 @@ export function resolveSignalSender(params: {
   sourceUuid?: string | null;
 }): SignalSender | null {
   const sourceNumber = params.sourceNumber?.trim();
-  if (sourceNumber) {
-    return {
-      kind: "phone",
-      raw: sourceNumber,
-      e164: normalizeE164(sourceNumber),
-    };
-  }
   const sourceUuid = params.sourceUuid?.trim();
+  if (sourceNumber) {
+    const e164 = normalizeE164(sourceNumber);
+    if (e164) {
+      return {
+        kind: "phone",
+        raw: sourceNumber,
+        e164,
+        ...(sourceUuid ? { aliases: { uuid: sourceUuid } } : {}),
+      };
+    }
+  }
   if (sourceUuid) {
     return { kind: "uuid", raw: sourceUuid };
   }
@@ -80,7 +79,7 @@ function parseSignalAllowEntry(entry: string): SignalAllowEntry | null {
   }
 
   const stripped = stripSignalPrefix(trimmed);
-  const lower = stripped.toLowerCase();
+  const lower = normalizeLowercaseStringOrEmpty(stripped);
   if (lower.startsWith("uuid:")) {
     const raw = stripped.slice("uuid:".length).trim();
     if (!raw) {
@@ -93,7 +92,8 @@ function parseSignalAllowEntry(entry: string): SignalAllowEntry | null {
     return { kind: "uuid", raw: stripped };
   }
 
-  return { kind: "phone", e164: normalizeE164(stripped) };
+  const e164 = normalizeE164(stripped);
+  return e164 ? { kind: "phone", e164 } : null;
 }
 
 export function normalizeSignalAllowRecipient(entry: string): string | undefined {
@@ -114,26 +114,19 @@ export function isSignalSenderAllowed(sender: SignalSender, allowFrom: string[])
   if (parsed.some((entry) => entry.kind === "any")) {
     return true;
   }
+  // A sender carries an alias when signal-cli has both forms cached locally
+  // (e.g. after the daemon resolved a number → uuid for an outbound send).
+  // Treat both forms as the same identity so an allowlist entry approved as
+  // one form keeps matching after the other becomes available.
+  const senderE164 = sender.kind === "phone" ? sender.e164 : sender.aliases?.e164;
+  const senderUuid = sender.kind === "uuid" ? sender.raw : sender.aliases?.uuid;
   return parsed.some((entry) => {
-    if (entry.kind === "phone" && sender.kind === "phone") {
-      return entry.e164 === sender.e164;
+    if (entry.kind === "phone") {
+      return senderE164 !== undefined && entry.e164 === senderE164;
     }
-    if (entry.kind === "uuid" && sender.kind === "uuid") {
-      return entry.raw === sender.raw;
+    if (entry.kind === "uuid") {
+      return senderUuid !== undefined && entry.raw === senderUuid;
     }
     return false;
   });
-}
-
-export function isSignalGroupAllowed(params: {
-  groupPolicy: "open" | "disabled" | "allowlist";
-  allowFrom: string[];
-  sender: SignalSender;
-}): boolean {
-  return evaluateSenderGroupAccessForPolicy({
-    groupPolicy: params.groupPolicy,
-    groupAllowFrom: params.allowFrom,
-    senderId: params.sender.raw,
-    isSenderAllowed: () => isSignalSenderAllowed(params.sender, params.allowFrom),
-  }).allowed;
 }

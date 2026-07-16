@@ -1,3 +1,6 @@
+import { expectDefined } from "@openclaw/normalization-core";
+// Assistant error formatting helpers normalize assistant-visible error payloads.
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 const ERROR_PAYLOAD_PREFIX_RE =
   /^(?:error|(?:[a-z][\w-]*\s+)?api\s*error|apierror|openai\s*error|anthropic\s*error|gateway\s*error|codex\s*error)(?:\s+\d{3})?[:\s-]+/i;
 const HTTP_STATUS_DELIMITER_RE = /(?:\s*:\s*|\s+)/;
@@ -10,11 +13,23 @@ const HTTP_STATUS_CODE_PREFIX_RE = new RegExp(
   "i",
 );
 const HTML_ERROR_PREFIX_RE = /^\s*(?:<!doctype\s+html\b|<html\b)/i;
+const HTML_CLOSE_RE = /<\/html>/i;
 const CLOUDFLARE_HTML_ERROR_CODES = new Set([521, 522, 523, 524, 525, 526, 530]);
+const STANDALONE_HTML_ERROR_HINT_RE =
+  /\bcloudflare\b|cdn-cgi\/challenge-platform|challenge-error-text|enable javascript and cookies to continue|access denied|forbidden|service unavailable|bad gateway|web server is down|captcha|attention required/i;
+const GENERIC_PROVIDER_INTERNAL_ERROR_RE = /an error occurred while processing your request/i;
+const SUPPORT_REQUEST_ID_RE = /(?:request[\s_-]*id)\s*[:#]?\s*([a-z0-9][a-z0-9_-]{6,}[a-z0-9])/i;
+const GENERIC_PROVIDER_INTERNAL_ERROR_USER_MESSAGE =
+  "The AI service returned an internal error. Please try again in a moment.";
+
+export const MALFORMED_STREAMING_FRAGMENT_ERROR_MESSAGE =
+  "OpenClaw transport error: malformed_streaming_fragment";
+const MALFORMED_STREAMING_FRAGMENT_USER_MESSAGE =
+  "LLM streaming response contained a malformed fragment. Please try again.";
 
 type ErrorPayload = Record<string, unknown>;
 
-export type ApiErrorInfo = {
+type ApiErrorInfo = {
   httpCode?: string;
   type?: string;
   message?: string;
@@ -43,6 +58,10 @@ function isErrorPayloadObject(payload: unknown): payload is ErrorPayload {
       ) {
         return true;
       }
+    }
+    // Flat error payloads: {"error":"insufficient_balance","message":"..."}
+    if (typeof err === "string" && typeof record.message === "string") {
+      return true;
     }
   }
   return false;
@@ -94,6 +113,14 @@ export function isCloudflareOrHtmlErrorPage(raw: string): boolean {
     return false;
   }
 
+  if (
+    HTML_ERROR_PREFIX_RE.test(trimmed) &&
+    HTML_CLOSE_RE.test(trimmed) &&
+    STANDALONE_HTML_ERROR_HINT_RE.test(trimmed)
+  ) {
+    return true;
+  }
+
   const status = extractLeadingHttpStatus(trimmed);
   if (!status || status.code < 500) {
     return false;
@@ -104,7 +131,18 @@ export function isCloudflareOrHtmlErrorPage(raw: string): boolean {
   }
 
   return (
-    status.code < 600 && HTML_ERROR_PREFIX_RE.test(status.rest) && /<\/html>/i.test(status.rest)
+    status.code < 600 && HTML_ERROR_PREFIX_RE.test(status.rest) && HTML_CLOSE_RE.test(status.rest)
+  );
+}
+
+export function isGenericProviderInternalError(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return (
+    GENERIC_PROVIDER_INTERNAL_ERROR_RE.test(trimmed) &&
+    (/help\.openai\.com/i.test(trimmed) || SUPPORT_REQUEST_ID_RE.test(trimmed))
   );
 }
 
@@ -123,7 +161,7 @@ export function parseApiErrorInfo(raw?: string): ApiErrorInfo | null {
   const httpPrefixMatch = candidate.match(/^(\d{3})\s+(.+)$/s);
   if (httpPrefixMatch) {
     httpCode = httpPrefixMatch[1];
-    candidate = httpPrefixMatch[2].trim();
+    candidate = expectDefined(httpPrefixMatch[2], "http prefix match capture group 2").trim();
   }
 
   const payload = parseApiErrorPayload(candidate);
@@ -154,6 +192,9 @@ export function parseApiErrorInfo(raw?: string): ApiErrorInfo | null {
     if (typeof err.message === "string") {
       errMessage = err.message;
     }
+  } else if (typeof payload.error === "string") {
+    // Flat error payloads: {"error":"insufficient_balance","message":"..."}
+    errType = payload.error;
   }
 
   return {
@@ -170,14 +211,31 @@ export function formatRawAssistantErrorForUi(raw?: string): string {
     return "LLM request failed with an unknown error.";
   }
 
+  if (trimmed === MALFORMED_STREAMING_FRAGMENT_ERROR_MESSAGE) {
+    return MALFORMED_STREAMING_FRAGMENT_USER_MESSAGE;
+  }
+
+  if (isGenericProviderInternalError(trimmed)) {
+    return GENERIC_PROVIDER_INTERNAL_ERROR_USER_MESSAGE;
+  }
+
   const leadingStatus = extractLeadingHttpStatus(trimmed);
-  if (leadingStatus && isCloudflareOrHtmlErrorPage(trimmed)) {
+  const isHtmlChallenge = isCloudflareOrHtmlErrorPage(trimmed);
+  if (leadingStatus && isHtmlChallenge) {
     return `The AI service is temporarily unavailable (HTTP ${leadingStatus.code}). Please try again in a moment.`;
+  }
+
+  if (isHtmlChallenge) {
+    return (
+      "The provider returned an HTML error page instead of an API response. " +
+      "This usually means a CDN or gateway (e.g. Cloudflare) blocked the request. " +
+      "Retry in a moment or check provider status."
+    );
   }
 
   const httpMatch = trimmed.match(HTTP_STATUS_PREFIX_RE);
   if (httpMatch) {
-    const rest = httpMatch[2].trim();
+    const rest = expectDefined(httpMatch[2], "http match capture group 2").trim();
     if (!rest.startsWith("{")) {
       return `HTTP ${httpMatch[1]}: ${rest}`;
     }
@@ -190,5 +248,5 @@ export function formatRawAssistantErrorForUi(raw?: string): string {
     return `${prefix}${type}: ${info.message}`;
   }
 
-  return trimmed.length > 600 ? `${trimmed.slice(0, 600)}…` : trimmed;
+  return trimmed.length > 600 ? `${truncateUtf16Safe(trimmed, 600)}…` : trimmed;
 }

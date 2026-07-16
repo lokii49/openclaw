@@ -1,5 +1,7 @@
+// Feishu helper module supports config schema behavior.
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
-import { z } from "openclaw/plugin-sdk/zod";
+import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
+import { z } from "zod";
 export { z };
 import { buildSecretInputSchema, hasConfiguredSecretInput } from "./secret-input.js";
 
@@ -20,6 +22,23 @@ const FeishuDomainSchema = z.union([
   z.string().url().startsWith("https://"),
 ]);
 const FeishuConnectionModeSchema = z.enum(["websocket", "webhook"]);
+const TtsOverrideSchema = z
+  .object({
+    auto: z.enum(["off", "always", "inbound", "tagged"]).optional(),
+    enabled: z.boolean().optional(),
+    mode: z.enum(["final", "all"]).optional(),
+    provider: z.string().optional(),
+    persona: z.string().optional(),
+    personas: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+    summaryModel: z.string().optional(),
+    modelOverrides: z.record(z.string(), z.unknown()).optional(),
+    providers: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+    prefsPath: z.string().optional(),
+    maxTextLength: z.number().int().min(1).optional(),
+    timeoutMs: z.number().int().min(1000).max(120000).optional(),
+  })
+  .strict()
+  .optional();
 
 const ToolPolicySchema = z
   .object({
@@ -48,15 +67,34 @@ const MarkdownConfigSchema = z
 // Message render mode: auto (default) = detect markdown, raw = plain text, card = always card
 const RenderModeSchema = z.enum(["auto", "raw", "card"]).optional();
 
-// Streaming card mode: when enabled, card replies use Feishu's Card Kit streaming API
-// for incremental text display with a "Thinking..." placeholder
-const StreamingModeSchema = z.boolean().optional();
-
+// Field names must match the core coalesce reader
+// (resolveChannelStreamingBlockCoalesce); the legacy feishu-local
+// enabled/minDelayMs/maxDelayMs spelling was never read by any runtime path.
 const BlockStreamingCoalesceSchema = z
   .object({
-    enabled: z.boolean().optional(),
-    minDelayMs: z.number().int().positive().optional(),
-    maxDelayMs: z.number().int().positive().optional(),
+    minChars: z.number().int().positive().optional(),
+    maxChars: z.number().int().positive().optional(),
+    idleMs: z.number().int().nonnegative().optional(),
+  })
+  .strict()
+  .optional();
+
+// Streaming config: `mode` gates Feishu Card Kit streaming-card replies
+// ("partial" = streaming cards, default; "off" = single final message);
+// `chunkMode`/`block` are the shared delivery controls. Legacy boolean
+// `streaming` and flat chunkMode/blockStreaming/blockStreamingCoalesce keys
+// migrate via `openclaw doctor --fix`.
+const FeishuStreamingSchema = z
+  .object({
+    mode: z.enum(["off", "partial"]).optional(),
+    chunkMode: z.enum(["length", "newline"]).optional(),
+    block: z
+      .object({
+        enabled: z.boolean().optional(),
+        coalesce: BlockStreamingCoalesceSchema,
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .optional();
@@ -99,6 +137,8 @@ const FeishuToolsConfigSchema = z
     drive: z.boolean().optional(), // Cloud storage operations (default: true)
     perm: z.boolean().optional(), // Permission management (default: false, sensitive)
     scopes: z.boolean().optional(), // App scopes diagnostic (default: true)
+    bitable: z.boolean().optional(), // Bitable/Base operations (default: true)
+    base: z.boolean().optional(), // Alias for bitable tools (default: true)
   })
   .strict()
   .optional();
@@ -122,8 +162,9 @@ const GroupSessionScopeSchema = z
  * - "disabled" (default): All messages in a group share one session
  * - "enabled": Messages in different topics get separate sessions
  *
- * Topic routing uses `root_id` when present to keep session continuity and
- * falls back to `thread_id` when `root_id` is unavailable.
+ * Topic routing uses Feishu topic-group `thread_id` when the event identifies a
+ * native topic group, and keeps `root_id` precedence for normal groups so
+ * reply-created threads stay on the initiating message session.
  */
 const TopicSessionModeSchema = z.enum(["disabled", "enabled"]).optional();
 const ReactionNotificationModeSchema = z.enum(["off", "own", "all"]).optional();
@@ -138,7 +179,7 @@ const ReactionNotificationModeSchema = z.enum(["off", "own", "all"]).optional();
  */
 const ReplyInThreadSchema = z.enum(["disabled", "enabled"]).optional();
 
-export const FeishuGroupSchema = z
+const FeishuGroupSchema = z
   .object({
     requireMention: z.boolean().optional(),
     tools: ToolPolicySchema,
@@ -169,19 +210,18 @@ const FeishuSharedConfigShape = {
   dmHistoryLimit: z.number().int().min(0).optional(),
   dms: z.record(z.string(), DmConfigSchema).optional(),
   textChunkLimit: z.number().int().positive().optional(),
-  chunkMode: z.enum(["length", "newline"]).optional(),
-  blockStreamingCoalesce: BlockStreamingCoalesceSchema,
   mediaMaxMb: z.number().positive().optional(),
   httpTimeoutMs: z.number().int().positive().max(300_000).optional(),
   heartbeat: ChannelHeartbeatVisibilitySchema,
   renderMode: RenderModeSchema,
-  streaming: StreamingModeSchema,
+  streaming: FeishuStreamingSchema,
   tools: FeishuToolsConfigSchema,
   actions: ChannelActionsSchema,
   replyInThread: ReplyInThreadSchema,
   reactionNotifications: ReactionNotificationModeSchema,
   typingIndicator: z.boolean().optional(),
   resolveSenderNames: z.boolean().optional(),
+  tts: TtsOverrideSchema,
 };
 
 /**
@@ -237,7 +277,7 @@ export const FeishuConfigSchema = z
     const defaultAccount = value.defaultAccount?.trim();
     if (defaultAccount && value.accounts && Object.keys(value.accounts).length > 0) {
       const normalizedDefaultAccount = normalizeAccountId(defaultAccount);
-      if (!Object.prototype.hasOwnProperty.call(value.accounts, normalizedDefaultAccount)) {
+      if (!Object.hasOwn(value.accounts, normalizedDefaultAccount)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ["defaultAccount"],
@@ -312,3 +352,7 @@ export const FeishuConfigSchema = z
       }
     }
   });
+
+export const FeishuChannelConfigSchema = buildChannelConfigSchema(FeishuConfigSchema, {
+  jsonSchemaMode: "input",
+});

@@ -1,18 +1,61 @@
+// Memory Host SDK module implements backend config behavior.
+import fs from "node:fs";
 import path from "node:path";
-import { resolveAgentWorkspaceDir } from "../../../../src/agents/agent-scope.js";
-import { parseDurationMs } from "../../../../src/cli/parse-duration.js";
-import type { OpenClawConfig } from "../../../../src/config/config.js";
-import type { SessionSendPolicyConfig } from "../../../../src/config/types.base.js";
-import type {
-  MemoryBackend,
-  MemoryCitationsMode,
-  MemoryQmdConfig,
-  MemoryQmdIndexPath,
-  MemoryQmdMcporterConfig,
-  MemoryQmdSearchMode,
-} from "../../../../src/config/types.memory.js";
-import { resolveUserPath } from "../../../../src/utils.js";
-import { splitShellArgs } from "../../../../src/utils/shell-argv.js";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import {
+  normalizeStringEntries,
+  uniqueStrings,
+} from "@openclaw/normalization-core/string-normalization";
+import {
+  MEMORY_HOST_ROOT_FILENAME,
+  type MemoryBackend,
+  type MemoryCitationsMode,
+  type MemoryQmdConfig,
+  type MemoryQmdIndexPath,
+  type MemoryQmdMcporterConfig,
+  type MemoryQmdSearchMode,
+  type MemoryQmdStartupMode,
+  type OpenClawConfig,
+  resolveMemoryHostAgentWorkspaceDir,
+  normalizeAgentId,
+  resolveMemoryHostUserPath,
+  type SessionSendPolicyConfig,
+  splitShellArgs,
+} from "./config-utils.js";
+import { isPathInside } from "./fs-utils.js";
+import { parseDurationMs } from "./openclaw-runtime-config.js";
+
+function escapeQmdExactFilePattern(fileName: string): string {
+  return fileName.replace(/[\\*?[\]{}()!+@]/g, "\\$&");
+}
+
+const WINDOWS_COMMAND_EXTENSION_RE =
+  /^((?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/]).*?\.(?:bat|cmd|cjs|exe|js|mjs|ps1))(?:\s+|$)/i;
+
+function resolveQmdCommand(rawCommand: string): string {
+  const trimmedCommand = rawCommand.trim();
+  const windowsCommand = resolveWindowsAbsoluteCommand(trimmedCommand);
+  if (windowsCommand) {
+    return windowsCommand;
+  }
+
+  const parsedCommand = splitShellArgs(trimmedCommand);
+  return parsedCommand?.[0] || trimmedCommand.split(/\s+/)[0] || "qmd";
+}
+
+function resolveWindowsAbsoluteCommand(rawCommand: string): string | undefined {
+  if (!path.win32.isAbsolute(rawCommand)) {
+    return undefined;
+  }
+
+  const extensionMatch = WINDOWS_COMMAND_EXTENSION_RE.exec(rawCommand);
+  if (extensionMatch) {
+    return extensionMatch[1];
+  }
+
+  const firstWhitespace = rawCommand.search(/\s/);
+  return firstWhitespace === -1 ? rawCommand : rawCommand.slice(0, firstWhitespace);
+}
 
 export type ResolvedMemoryBackendConfig = {
   backend: MemoryBackend;
@@ -20,17 +63,19 @@ export type ResolvedMemoryBackendConfig = {
   qmd?: ResolvedQmdConfig;
 };
 
-export type ResolvedQmdCollection = {
+/** @public */ export type ResolvedQmdCollection = {
   name: string;
   path: string;
   pattern: string;
   kind: "memory" | "custom" | "sessions";
 };
 
-export type ResolvedQmdUpdateConfig = {
+/** @public */ export type ResolvedQmdUpdateConfig = {
   intervalMs: number;
   debounceMs: number;
   onBoot: boolean;
+  startup: MemoryQmdStartupMode;
+  startupDelayMs: number;
   waitForBootSync: boolean;
   embedIntervalMs: number;
   commandTimeoutMs: number;
@@ -38,14 +83,14 @@ export type ResolvedQmdUpdateConfig = {
   embedTimeoutMs: number;
 };
 
-export type ResolvedQmdLimitsConfig = {
+/** @public */ export type ResolvedQmdLimitsConfig = {
   maxResults: number;
   maxSnippetChars: number;
   maxInjectedChars: number;
   timeoutMs: number;
 };
 
-export type ResolvedQmdSessionConfig = {
+/** @public */ export type ResolvedQmdSessionConfig = {
   enabled: boolean;
   exportDir?: string;
   retentionDays?: number;
@@ -61,6 +106,8 @@ export type ResolvedQmdConfig = {
   command: string;
   mcporter: ResolvedQmdMcporterConfig;
   searchMode: MemoryQmdSearchMode;
+  rerank?: boolean;
+  searchTool?: string;
   collections: ResolvedQmdCollection[];
   sessions: ResolvedQmdSessionConfig;
   update: ResolvedQmdUpdateConfig;
@@ -77,14 +124,16 @@ const DEFAULT_QMD_TIMEOUT_MS = 4_000;
 // Defaulting to `query` can be extremely slow on CPU-only systems (query expansion + rerank).
 // Prefer a faster mode for interactive use; users can opt into `query` for best recall.
 const DEFAULT_QMD_SEARCH_MODE: MemoryQmdSearchMode = "search";
+const DEFAULT_QMD_STARTUP: MemoryQmdStartupMode = "off";
+const DEFAULT_QMD_STARTUP_DELAY_MS = 120_000;
 const DEFAULT_QMD_EMBED_INTERVAL = "60m";
 const DEFAULT_QMD_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_QMD_UPDATE_TIMEOUT_MS = 120_000;
 const DEFAULT_QMD_EMBED_TIMEOUT_MS = 120_000;
 const DEFAULT_QMD_LIMITS: ResolvedQmdLimitsConfig = {
-  maxResults: 6,
-  maxSnippetChars: 700,
-  maxInjectedChars: 4_000,
+  maxResults: 4,
+  maxSnippetChars: 450,
+  maxInjectedChars: 2_200,
   timeoutMs: DEFAULT_QMD_TIMEOUT_MS,
 };
 const DEFAULT_QMD_MCPORTER: ResolvedQmdMcporterConfig = {
@@ -104,7 +153,7 @@ const DEFAULT_QMD_SCOPE: SessionSendPolicyConfig = {
 };
 
 function sanitizeName(input: string): string {
-  const lower = input.toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+  const lower = normalizeLowercaseStringOrEmpty(input).replace(/[^a-z0-9-]+/g, "-");
   const trimmed = lower.replace(/^-+|-+$/g, "");
   return trimmed || "collection";
 }
@@ -113,8 +162,34 @@ function scopeCollectionBase(base: string, agentId: string): string {
   return `${base}-${sanitizeName(agentId)}`;
 }
 
+function canonicalizePathForContainment(rawPath: string): string {
+  const resolved = path.resolve(rawPath);
+  let current = resolved;
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      const canonical = path.normalize(fs.realpathSync.native(current));
+      return path.normalize(path.join(canonical, ...suffix));
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return path.normalize(resolved);
+      }
+      suffix.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function isPathInsideRoot(candidatePath: string, rootPath: string): boolean {
+  return isPathInside(
+    canonicalizePathForContainment(rootPath),
+    canonicalizePathForContainment(candidatePath),
+  );
+}
+
 function ensureUniqueName(base: string, existing: Set<string>): string {
-  let name = sanitizeName(base);
+  const name = sanitizeName(base);
   if (!existing.has(name)) {
     existing.add(name);
     return name;
@@ -134,7 +209,7 @@ function resolvePath(raw: string, workspaceDir: string): string {
     throw new Error("path required");
   }
   if (trimmed.startsWith("~") || path.isAbsolute(trimmed)) {
-    return path.normalize(resolveUserPath(trimmed));
+    return path.normalize(resolveMemoryHostUserPath(trimmed));
   }
   return path.normalize(path.resolve(workspaceDir, trimmed));
 }
@@ -171,27 +246,49 @@ function resolveDebounceMs(raw: number | undefined): number {
 }
 
 function resolveTimeoutMs(raw: number | undefined, fallback: number): number {
-  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+  return resolvePositiveIntegerConfig(raw, fallback);
+}
+
+function resolvePositiveIntegerConfig(raw: number | undefined, fallback: number): number;
+function resolvePositiveIntegerConfig(raw: number | undefined): number | undefined;
+function resolvePositiveIntegerConfig(
+  raw: number | undefined,
+  fallback?: number,
+): number | undefined {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(raw));
+}
+
+function resolveStartupMode(raw: MemoryQmdConfig["update"]): MemoryQmdStartupMode {
+  const value = raw?.startup;
+  if (value === "idle" || value === "immediate" || value === "off") {
+    return value;
+  }
+  return DEFAULT_QMD_STARTUP;
+}
+
+function resolveStartupDelayMs(raw: number | undefined): number {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
     return Math.floor(raw);
   }
-  return fallback;
+  return DEFAULT_QMD_STARTUP_DELAY_MS;
 }
 
 function resolveLimits(raw?: MemoryQmdConfig["limits"]): ResolvedQmdLimitsConfig {
-  const parsed: ResolvedQmdLimitsConfig = { ...DEFAULT_QMD_LIMITS };
-  if (raw?.maxResults && raw.maxResults > 0) {
-    parsed.maxResults = Math.floor(raw.maxResults);
-  }
-  if (raw?.maxSnippetChars && raw.maxSnippetChars > 0) {
-    parsed.maxSnippetChars = Math.floor(raw.maxSnippetChars);
-  }
-  if (raw?.maxInjectedChars && raw.maxInjectedChars > 0) {
-    parsed.maxInjectedChars = Math.floor(raw.maxInjectedChars);
-  }
-  if (raw?.timeoutMs && raw.timeoutMs > 0) {
-    parsed.timeoutMs = Math.floor(raw.timeoutMs);
-  }
-  return parsed;
+  return {
+    maxResults: resolvePositiveIntegerConfig(raw?.maxResults, DEFAULT_QMD_LIMITS.maxResults),
+    maxSnippetChars: resolvePositiveIntegerConfig(
+      raw?.maxSnippetChars,
+      DEFAULT_QMD_LIMITS.maxSnippetChars,
+    ),
+    maxInjectedChars: resolvePositiveIntegerConfig(
+      raw?.maxInjectedChars,
+      DEFAULT_QMD_LIMITS.maxInjectedChars,
+    ),
+    timeoutMs: resolvePositiveIntegerConfig(raw?.timeoutMs, DEFAULT_QMD_LIMITS.timeoutMs),
+  };
 }
 
 function resolveSearchMode(raw?: MemoryQmdConfig["searchMode"]): MemoryQmdSearchMode {
@@ -201,6 +298,11 @@ function resolveSearchMode(raw?: MemoryQmdConfig["searchMode"]): MemoryQmdSearch
   return DEFAULT_QMD_SEARCH_MODE;
 }
 
+function resolveSearchTool(raw?: MemoryQmdConfig["searchTool"]): string | undefined {
+  const value = raw?.trim();
+  return value ? value : undefined;
+}
+
 function resolveSessionConfig(
   cfg: MemoryQmdConfig["sessions"],
   workspaceDir: string,
@@ -208,8 +310,7 @@ function resolveSessionConfig(
   const enabled = Boolean(cfg?.enabled);
   const exportDirRaw = cfg?.exportDir?.trim();
   const exportDir = exportDirRaw ? resolvePath(exportDirRaw, workspaceDir) : undefined;
-  const retentionDays =
-    cfg?.retentionDays && cfg.retentionDays > 0 ? Math.floor(cfg.retentionDays) : undefined;
+  const retentionDays = resolvePositiveIntegerConfig(cfg?.retentionDays);
   return {
     enabled,
     exportDir,
@@ -227,23 +328,47 @@ function resolveCustomPaths(
     return [];
   }
   const collections: ResolvedQmdCollection[] = [];
+  const seenRoots = new Set<string>();
   rawPaths.forEach((entry, index) => {
     const trimmedPath = entry?.path?.trim();
     if (!trimmedPath) {
       return;
     }
     let resolved: string;
+    let collectionPath: string;
     try {
       resolved = resolvePath(trimmedPath, workspaceDir);
     } catch {
       return;
     }
-    const pattern = entry.pattern?.trim() || "**/*.md";
-    const baseName = scopeCollectionBase(entry.name?.trim() || `custom-${index + 1}`, agentId);
+    collectionPath = resolved;
+    let pattern = entry.pattern?.trim() || "**/*.md";
+    try {
+      const stat = fs.statSync(resolved);
+      if (stat.isFile()) {
+        // When the configured path points directly to a file, normalize into a
+        // parent-directory collection with an exact-filename pattern, regardless
+        // of any user-supplied glob (a glob does not apply to a single file).
+        collectionPath = path.dirname(resolved);
+        pattern = escapeQmdExactFilePattern(path.basename(resolved));
+      }
+    } catch {
+      // not a file or can't stat, use as-is
+    }
+    const dedupeKey = `${collectionPath}\u0000${pattern}`;
+    if (seenRoots.has(dedupeKey)) {
+      return;
+    }
+    seenRoots.add(dedupeKey);
+    const explicitName = entry.name?.trim();
+    const baseName =
+      explicitName && !isPathInsideRoot(collectionPath, workspaceDir)
+        ? explicitName
+        : scopeCollectionBase(explicitName || `custom-${index + 1}`, agentId);
     const name = ensureUniqueName(baseName, existing);
     collections.push({
       name,
-      path: resolved,
+      path: collectionPath,
       pattern,
       kind: "custom",
     });
@@ -282,8 +407,7 @@ function resolveDefaultCollections(
     return [];
   }
   const entries: Array<{ path: string; pattern: string; base: string }> = [
-    { path: workspaceDir, pattern: "MEMORY.md", base: "memory-root" },
-    { path: workspaceDir, pattern: "memory.md", base: "memory-alt" },
+    { path: workspaceDir, pattern: MEMORY_HOST_ROOT_FILENAME, base: "memory-root" },
     { path: path.join(workspaceDir, "memory"), pattern: "**/*.md", base: "memory-dir" },
   ];
   return entries.map((entry) => ({
@@ -298,28 +422,58 @@ export function resolveMemoryBackendConfig(params: {
   cfg: OpenClawConfig;
   agentId: string;
 }): ResolvedMemoryBackendConfig {
+  const normalizedAgentId = normalizeAgentId(params.agentId);
   const backend = params.cfg.memory?.backend ?? DEFAULT_BACKEND;
   const citations = params.cfg.memory?.citations ?? DEFAULT_CITATIONS;
   if (backend !== "qmd") {
     return { backend: "builtin", citations };
   }
 
-  const workspaceDir = resolveAgentWorkspaceDir(params.cfg, params.agentId);
+  const workspaceDir = resolveMemoryHostAgentWorkspaceDir(params.cfg, normalizedAgentId);
   const qmdCfg = params.cfg.memory?.qmd;
   const includeDefaultMemory = qmdCfg?.includeDefaultMemory !== false;
   const nameSet = new Set<string>();
+  const agentEntry = params.cfg.agents?.list?.find(
+    (entry) => normalizeAgentId(entry?.id) === normalizedAgentId,
+  );
+  const mergedExtraPaths = normalizeStringEntries(
+    [
+      ...(params.cfg.agents?.defaults?.memorySearch?.extraPaths ?? []),
+      ...(agentEntry?.memorySearch?.extraPaths ?? []),
+    ].filter((value): value is string => typeof value === "string"),
+  );
+  const dedupedExtraPaths = uniqueStrings(mergedExtraPaths);
+  const searchExtraPaths = dedupedExtraPaths.map(
+    (pathValue): { path: string; pattern?: string; name?: string } => ({ path: pathValue }),
+  );
+  const mergedExtraCollections = [
+    ...(params.cfg.agents?.defaults?.memorySearch?.qmd?.extraCollections ?? []),
+    ...(agentEntry?.memorySearch?.qmd?.extraCollections ?? []),
+  ].filter(
+    (value): value is MemoryQmdIndexPath =>
+      value !== null && typeof value === "object" && typeof value.path === "string",
+  );
+
+  // Combine QMD-specific paths with extraPaths and per-agent cross-agent collections.
+  const allQmdPaths: MemoryQmdIndexPath[] = [
+    ...(qmdCfg?.paths ?? []),
+    ...searchExtraPaths,
+    ...mergedExtraCollections,
+  ];
+
   const collections = [
-    ...resolveDefaultCollections(includeDefaultMemory, workspaceDir, nameSet, params.agentId),
-    ...resolveCustomPaths(qmdCfg?.paths, workspaceDir, nameSet, params.agentId),
+    ...resolveDefaultCollections(includeDefaultMemory, workspaceDir, nameSet, normalizedAgentId),
+    ...resolveCustomPaths(allQmdPaths, workspaceDir, nameSet, normalizedAgentId),
   ];
 
   const rawCommand = qmdCfg?.command?.trim() || "qmd";
-  const parsedCommand = splitShellArgs(rawCommand);
-  const command = parsedCommand?.[0] || rawCommand.split(/\s+/)[0] || "qmd";
+  const command = resolveQmdCommand(rawCommand);
   const resolved: ResolvedQmdConfig = {
     command,
     mcporter: resolveMcporterConfig(qmdCfg?.mcporter),
     searchMode: resolveSearchMode(qmdCfg?.searchMode),
+    rerank: qmdCfg?.rerank,
+    searchTool: resolveSearchTool(qmdCfg?.searchTool),
     collections,
     includeDefaultMemory,
     sessions: resolveSessionConfig(qmdCfg?.sessions, workspaceDir),
@@ -327,6 +481,8 @@ export function resolveMemoryBackendConfig(params: {
       intervalMs: resolveIntervalMs(qmdCfg?.update?.interval),
       debounceMs: resolveDebounceMs(qmdCfg?.update?.debounceMs),
       onBoot: qmdCfg?.update?.onBoot !== false,
+      startup: resolveStartupMode(qmdCfg?.update),
+      startupDelayMs: resolveStartupDelayMs(qmdCfg?.update?.startupDelayMs),
       waitForBootSync: qmdCfg?.update?.waitForBootSync === true,
       embedIntervalMs: resolveEmbedIntervalMs(qmdCfg?.update?.embedInterval),
       commandTimeoutMs: resolveTimeoutMs(

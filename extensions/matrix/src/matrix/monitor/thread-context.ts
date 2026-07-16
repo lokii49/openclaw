@@ -1,3 +1,5 @@
+// Matrix plugin module implements thread context behavior.
+import { sliceUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { MatrixClient } from "../sdk.js";
 import { summarizeMatrixMessageContextEvent, trimMatrixMaybeString } from "./context-summary.js";
 import type { MatrixRawEvent } from "./types.js";
@@ -7,6 +9,7 @@ const MAX_THREAD_STARTER_BODY_LENGTH = 500;
 
 type MatrixThreadContext = {
   threadStarterBody?: string;
+  senderId?: string;
   senderLabel?: string;
   summary?: string;
 };
@@ -15,10 +18,10 @@ function truncateThreadStarterBody(value: string): string {
   if (value.length <= MAX_THREAD_STARTER_BODY_LENGTH) {
     return value;
   }
-  return `${value.slice(0, MAX_THREAD_STARTER_BODY_LENGTH - 3)}...`;
+  return `${sliceUtf16Safe(value, 0, MAX_THREAD_STARTER_BODY_LENGTH - 3)}...`;
 }
 
-export function summarizeMatrixThreadStarterEvent(event: MatrixRawEvent): string | undefined {
+function summarizeMatrixThreadStarterEvent(event: MatrixRawEvent): string | undefined {
   const body = summarizeMatrixMessageContextEvent(event);
   if (body) {
     return truncateThreadStarterBody(body);
@@ -73,7 +76,7 @@ export function createMatrixThreadContextResolver(params: {
 
     const rootEvent = await params.client
       .getEvent(input.roomId, input.threadRootId)
-      .catch((err) => {
+      .catch((err: unknown) => {
         params.logVerboseMessage(
           `matrix: failed resolving thread root room=${input.roomId} id=${input.threadRootId}: ${String(err)}`,
         );
@@ -99,6 +102,7 @@ export function createMatrixThreadContextResolver(params: {
         senderName,
         summary,
       }),
+      senderId,
       senderLabel,
       summary,
     });

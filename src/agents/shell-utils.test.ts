@@ -1,16 +1,50 @@
+// Verifies shell selection, PATH lookup, and platform-specific shell helpers.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { captureEnv } from "../test-utils/env.js";
-import { getShellConfig, resolvePowerShellPath, resolveShellFromPath } from "./shell-utils.js";
+import {
+  detectRuntimeShell,
+  getBashShellConfig,
+  getShellEnv,
+  getShellConfig,
+  sanitizeBinaryOutput,
+} from "./shell-utils.js";
 
 const isWin = process.platform === "win32";
+
+describe("sanitizeBinaryOutput", () => {
+  it("removes ANSI wrappers while retaining printable output", () => {
+    expect(sanitizeBinaryOutput("\u001b[31mred\u001b[0m")).toBe("red");
+    expect(sanitizeBinaryOutput("\u009b31mred\u009b0m")).toBe("red");
+  });
+
+  it("preserves unterminated OSC and pending CSI text at chunk boundaries", () => {
+    expect(sanitizeBinaryOutput("\u001b]unterminated")).toBe("\\x1b]unterminated");
+    expect(sanitizeBinaryOutput("before\u009b31;")).toBe("before\\x9b31;");
+    expect(sanitizeBinaryOutput("\u001b[") + sanitizeBinaryOutput("Ksecret")).toBe("\\x1b[Ksecret");
+  });
+
+  it("applies caller control policy while CSI remains active", () => {
+    // SOH executes independently, then "d" terminates CSI as its final byte.
+    expect(sanitizeBinaryOutput("\u009b\u0001done")).toBe("\\x01one");
+    expect(sanitizeBinaryOutput("\u009b31\u0018done")).toBe("done");
+    expect(sanitizeBinaryOutput("\u001b[31\u001adone")).toBe("done");
+  });
+
+  it("escapes residual C0, DEL, and C1 controls", () => {
+    expect(sanitizeBinaryOutput("a\u0000\u0007\u007f\u0080b\t\n")).toBe(
+      "a\\x00\\x07\\x7f\\x80b\t\n",
+    );
+  });
+});
 
 function createTempCommandDir(
   tempDirs: string[],
   files: Array<{ name: string; executable?: boolean }>,
 ): string {
+  // Temporary PATH entries model available shell binaries and permissions.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-shell-"));
   tempDirs.push(dir);
   for (const file of files) {
@@ -41,9 +75,14 @@ describe("getShellConfig", () => {
 
   if (isWin) {
     it("uses PowerShell on Windows", () => {
-      const { shell } = getShellConfig();
+      const { shell, args } = getShellConfig();
       const normalized = shell.toLowerCase();
-      expect(normalized.includes("powershell") || normalized.includes("pwsh")).toBe(true);
+      if (normalized.includes("powershell")) {
+        expect(normalized).toContain("powershell");
+      } else {
+        expect(normalized).toContain("pwsh");
+      }
+      expect(args).toEqual(["-NoProfile", "-NonInteractive", "-Command"]);
     });
     return;
   }
@@ -51,34 +90,133 @@ describe("getShellConfig", () => {
   it("prefers bash when fish is default and bash is on PATH", () => {
     const binDir = createTempCommandDir(tempDirs, [{ name: "bash" }]);
     process.env.PATH = binDir;
-    const { shell } = getShellConfig();
+    const { shell, args } = getShellConfig();
     expect(shell).toBe(path.join(binDir, "bash"));
+    expect(args).toEqual(["--noprofile", "--norc", "-c"]);
   });
 
   it("falls back to sh when fish is default and bash is missing", () => {
     const binDir = createTempCommandDir(tempDirs, [{ name: "sh" }]);
     process.env.PATH = binDir;
-    const { shell } = getShellConfig();
+    const { shell, args } = getShellConfig();
     expect(shell).toBe(path.join(binDir, "sh"));
+    expect(args).toEqual(["-c"]);
   });
 
   it("falls back to env shell when fish is default and no sh is available", () => {
     process.env.PATH = "";
-    const { shell } = getShellConfig();
+    const { shell, args } = getShellConfig();
     expect(shell).toBe("/usr/bin/fish");
+    expect(args).toEqual(["--no-config", "-c"]);
+  });
+
+  it("uses startup-suppressed args for zsh env shells", () => {
+    process.env.SHELL = "/bin/zsh";
+    process.env.PATH = "";
+    const { shell, args } = getShellConfig();
+    expect(shell).toBe("/bin/zsh");
+    expect(args).toEqual(["-f", "-c"]);
+  });
+
+  it("uses startup-suppressed args for bash env shells", () => {
+    process.env.SHELL = "/bin/bash";
+    process.env.PATH = "";
+    const { shell, args } = getShellConfig();
+    expect(shell).toBe("/bin/bash");
+    expect(args).toEqual(["--noprofile", "--norc", "-c"]);
   });
 
   it("uses sh when SHELL is unset", () => {
     delete process.env.SHELL;
     process.env.PATH = "";
-    const { shell } = getShellConfig();
+    const { shell, args } = getShellConfig();
     expect(shell).toBe("sh");
+    expect(args).toEqual(["-c"]);
+  });
+
+  it("uses an explicit custom shell path through the same resolver", () => {
+    const binDir = createTempCommandDir(tempDirs, [{ name: "zsh" }]);
+    const shellPath = path.join(binDir, "zsh");
+
+    expect(getShellConfig(shellPath)).toEqual({ shell: shellPath, args: ["-f", "-c"] });
+  });
+
+  it("rejects a missing explicit custom shell path", () => {
+    expect(() => getShellConfig(path.join(os.tmpdir(), "missing-openclaw-shell"))).toThrow(
+      "Custom shell path not found",
+    );
+  });
+
+  it("falls back to sh on PATH when SHELL is /usr/bin/false", () => {
+    const binDir = createTempCommandDir(tempDirs, [{ name: "sh" }]);
+    process.env.SHELL = "/usr/bin/false";
+    process.env.PATH = binDir;
+    const { shell, args } = getShellConfig();
+    expect(shell).toBe(path.join(binDir, "sh"));
+    expect(args).toEqual(["-c"]);
+  });
+
+  it("falls back to sh on PATH when SHELL is /sbin/nologin", () => {
+    const binDir = createTempCommandDir(tempDirs, [{ name: "sh" }]);
+    process.env.SHELL = "/sbin/nologin";
+    process.env.PATH = binDir;
+    const { shell, args } = getShellConfig();
+    expect(shell).toBe(path.join(binDir, "sh"));
+    expect(args).toEqual(["-c"]);
+  });
+
+  it("falls back to startup-suppressed bash on PATH when SHELL is a placeholder", () => {
+    const binDir = createTempCommandDir(tempDirs, [{ name: "bash" }]);
+    process.env.SHELL = "/usr/bin/false";
+    process.env.PATH = binDir;
+    const { shell, args } = getShellConfig();
+    expect(shell).toBe(path.join(binDir, "bash"));
+    expect(args).toEqual(["--noprofile", "--norc", "-c"]);
+  });
+
+  it("falls back to bare sh when SHELL is a placeholder and no sh is on PATH", () => {
+    process.env.SHELL = "/usr/bin/false";
+    process.env.PATH = "";
+    const { shell, args } = getShellConfig();
+    expect(shell).toBe("sh");
+    expect(args).toEqual(["-c"]);
   });
 });
 
-describe("resolveShellFromPath", () => {
-  let envSnapshot: ReturnType<typeof captureEnv>;
+describe("getBashShellConfig", () => {
   const tempDirs: string[] = [];
+  let envSnapshot: ReturnType<typeof captureEnv>;
+
+  beforeEach(() => {
+    envSnapshot = captureEnv(["ProgramFiles", "ProgramFiles(x86)", "PATH"]);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    envSnapshot.restore();
+    for (const dir of tempDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("finds Git Bash under ProgramFiles", () => {
+    const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-git-bash-"));
+    tempDirs.push(programFiles);
+    const bashDir = path.join(programFiles, "Git", "bin");
+    fs.mkdirSync(bashDir, { recursive: true });
+    const bashPath = path.join(bashDir, "bash.exe");
+    fs.writeFileSync(bashPath, "");
+
+    process.env.ProgramFiles = programFiles;
+    process.env.PATH = "";
+
+    expect(getBashShellConfig()).toEqual({ shell: bashPath, args: ["-c"] });
+  });
+});
+
+describe("getShellEnv", () => {
+  let envSnapshot: ReturnType<typeof captureEnv>;
 
   beforeEach(() => {
     envSnapshot = captureEnv(["PATH"]);
@@ -86,36 +224,57 @@ describe("resolveShellFromPath", () => {
 
   afterEach(() => {
     envSnapshot.restore();
-    for (const dir of tempDirs.splice(0)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
   });
 
-  it("returns undefined when PATH is empty", () => {
-    process.env.PATH = "";
-    expect(resolveShellFromPath("bash")).toBeUndefined();
-  });
+  it("returns an env object with the OpenClaw bin dir on PATH", () => {
+    process.env.PATH = "/usr/bin";
+    const env = getShellEnv();
 
-  if (isWin) {
-    return;
-  }
-
-  it("returns the first executable match from PATH", () => {
-    const notExecutable = createTempCommandDir(tempDirs, [{ name: "bash", executable: false }]);
-    const executable = createTempCommandDir(tempDirs, [{ name: "bash", executable: true }]);
-    process.env.PATH = [notExecutable, executable].join(path.delimiter);
-    expect(resolveShellFromPath("bash")).toBe(path.join(executable, "bash"));
-  });
-
-  it("returns undefined when command does not exist", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-shell-empty-"));
-    tempDirs.push(dir);
-    process.env.PATH = dir;
-    expect(resolveShellFromPath("bash")).toBeUndefined();
+    expect(env.PATH).toContain("/usr/bin");
+    expect(env.PATH).toContain(".openclaw");
   });
 });
 
-describe("resolvePowerShellPath", () => {
+describe("detectRuntimeShell", () => {
+  let envSnapshot: ReturnType<typeof captureEnv>;
+
+  beforeEach(() => {
+    envSnapshot = captureEnv([
+      "OPENCLAW_SHELL",
+      "SHELL",
+      "POWERSHELL_DISTRIBUTION_CHANNEL",
+      "BASH_VERSION",
+      "ZSH_VERSION",
+      "FISH_VERSION",
+      "KSH_VERSION",
+      "NU_VERSION",
+      "NUSHELL_VERSION",
+    ]);
+    delete process.env.OPENCLAW_SHELL;
+    delete process.env.POWERSHELL_DISTRIBUTION_CHANNEL;
+    delete process.env.BASH_VERSION;
+    delete process.env.ZSH_VERSION;
+    delete process.env.FISH_VERSION;
+    delete process.env.KSH_VERSION;
+    delete process.env.NU_VERSION;
+    delete process.env.NUSHELL_VERSION;
+  });
+
+  afterEach(() => {
+    envSnapshot.restore();
+  });
+
+  if (!isWin) {
+    it("ignores non-interactive SHELL placeholders and falls through to runtime hints", () => {
+      process.env.SHELL = "/usr/bin/false";
+      process.env.BASH_VERSION = "5.2.0";
+
+      expect(detectRuntimeShell()).toBe("bash");
+    });
+  }
+});
+
+describe("getShellConfig on Windows", () => {
   let envSnapshot: ReturnType<typeof captureEnv>;
   const tempDirs: string[] = [];
 
@@ -128,9 +287,11 @@ describe("resolvePowerShellPath", () => {
       "WINDIR",
       "PATH",
     ]);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     envSnapshot.restore();
     for (const dir of tempDirs.splice(0)) {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -151,7 +312,7 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(pwsh7Path);
+    expect(getShellConfig().shell).toBe(pwsh7Path);
   });
 
   it("prefers ProgramW6432 PowerShell 7 when ProgramFiles lacks pwsh", () => {
@@ -169,7 +330,7 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(pwsh7Path);
+    expect(getShellConfig().shell).toBe(pwsh7Path);
   });
 
   it("finds pwsh on PATH when not in standard install locations", () => {
@@ -186,7 +347,7 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(pwshPath);
+    expect(getShellConfig().shell).toBe(pwshPath);
   });
 
   it("falls back to Windows PowerShell 5.1 path when pwsh is unavailable", () => {
@@ -204,6 +365,6 @@ describe("resolvePowerShellPath", () => {
     delete process.env.ProgramW6432;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(ps51Path);
+    expect(getShellConfig().shell).toBe(ps51Path);
   });
 });
