@@ -28,6 +28,17 @@ export const PresenceEntrySchema = closedObject({
   roles: Type.Optional(Type.Array(NonEmptyString)),
   scopes: Type.Optional(Type.Array(NonEmptyString)),
   instanceId: Type.Optional(NonEmptyString),
+  user: Type.Optional(
+    closedObject({
+      /** Opaque identity key: authenticated email today, durable profile id later. Clients group presence by this. */
+      id: NonEmptyString,
+      email: Type.Optional(NonEmptyString),
+      name: Type.Optional(NonEmptyString),
+      avatarUrl: Type.Optional(NonEmptyString),
+    }),
+  ),
+  /** Session keys this connection is actively subscribed to (watching). Sorted lexicographically for deterministic snapshots. */
+  watchedSessions: Type.Optional(Type.Array(NonEmptyString)),
 });
 
 /** Health snapshot is intentionally opaque because providers contribute nested shapes. */

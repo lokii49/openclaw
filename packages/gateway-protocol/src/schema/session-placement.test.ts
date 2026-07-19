@@ -205,8 +205,22 @@ describe("session dispatch protocol schemas", () => {
         state: "reclaimed",
         ...basePlacement,
         ...workerOwnedFields,
+        workspaceResultConflict: {
+          paths: ["src/local.ts"],
+          stagedResultRef: "refs/openclaw/worker-results/claim-1",
+        },
       }),
     ).toBe(true);
+    expect(
+      Value.Check(SessionPlacementSchema, {
+        state: "reclaimed",
+        ...basePlacement,
+        workspaceResultConflict: {
+          paths: [],
+          stagedResultRef: "refs/openclaw/worker-results/claim-1",
+        },
+      }),
+    ).toBe(false);
   });
 
   it("requires recovery evidence for failed placement", () => {
@@ -279,6 +293,30 @@ describe("session dispatch protocol schemas", () => {
         ...basePlacement,
         ...workerOwnedFields,
         unexpected: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects extra fields in dispatch params and results", () => {
+    const active = {
+      state: "active" as const,
+      ...basePlacement,
+      ...workerOwnedFields,
+    };
+    expect(
+      validateSessionsDispatchResult({
+        ok: true,
+        key: "agent:main:dispatch",
+        sessionId: "session-1",
+        placement: active,
+        extra: true,
+      }),
+    ).toBe(false);
+    expect(
+      validateSessionsDispatchParams({
+        key: "agent:main:dispatch",
+        profileId: "development",
+        extra: true,
       }),
     ).toBe(false);
   });
